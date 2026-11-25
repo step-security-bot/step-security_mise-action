@@ -28,6 +28,12 @@ inputs:
       Or $XDG_DATA_HOME/mise if $XDG_DATA_HOME is set.
       Or $MISE_DATA_DIR if $MISE_DATA_DIR is set.
       When set, the action also exports it as MISE_DATA_DIR (overriding any existing value) so tools install into the cached directory. mise's state directory is not moved; set MISE_STATE_DIR for that.
+  mise_env:
+    required: false
+    description: |
+      The mise environment(s) to use, such as "ci" or "ci,linux". The action exports it as MISE_ENV
+      (overriding any existing value), so the cache key, `mise install`, and later steps in the job
+      all load the same `mise.<env>.toml` configs.
   tool_versions:
     required: false
     description: If present, this value will be written to the .tool-versions file
@@ -45,6 +51,10 @@ inputs:
   install_args:
     required: false
     description: Arguments to pass to `mise install` such as "bun" to only install bun. When a repo mise lock file is present, the action automatically adds `--locked` unless you already provided it.
+  monorepo:
+    required: false
+    default: "true"
+    description: Automatically pass `--monorepo` to `mise install` when the mise configuration has `monorepo.config_roots`. Set to false to opt out.
   bootstrap:
     required: false
     default: "false"
@@ -70,16 +80,28 @@ inputs:
     required: false
     default: "false"
     description: if true, save the cache in the post step instead of right after install, so tools installed by later steps (e.g. monorepo sub-projects or task tools) are included. Only applies on a cache miss. The post step runs even if a later step fails, as the immediate save would have.
+  cache_restore_retry_budget:
+    required: false
+    default: "0s"
+    description: Total time to keep retrying a cache restore that GitHub throttles with HTTP 429, as a duration like `60s`. Each wait is at least the advertised Retry-After plus up to 2s of jitter and counts against the budget. `0s` disables retries. A cache miss is never retried.
+  cache_save_retry_budget:
+    required: false
+    default: "0s"
+    description: Total time to keep retrying a cache save that GitHub throttles with HTTP 429, as a duration like `60s`. Each wait is at least the advertised Retry-After plus up to 2s of jitter and counts against the budget. `0s` disables retries. A reservation conflict (another job is saving the same key) is never retried.
   cache_key_prefix:
     required: false
     default: "mise-v1"
     description: The prefix key to use for the cache, change this to invalidate the cache
+  cache_max_age_days:
+    required: false
+    default: "30"
+    description: Rebuild the cache from scratch at least this often, so a frequently used cache still picks up the latest mise and tools. Adds a period number to the default cache key. Set 0 to disable.
   cache_key:
     required: false
     description: |
       Override the complete cache key (ignores all other cache key options).
       Supports template variables: {{version}}, {{cache_key_prefix}}, {{platform}}, {{file_hash}},
-      {{mise_env}}, {{install_args_hash}}, {{bootstrap_hash}}, {{default}}, {{env.VAR_NAME}} for environment variables,
+      {{mise_env}}, {{install_args_hash}}, {{bootstrap_hash}}, {{cache_period}}, {{default}}, {{env.VAR_NAME}} for environment variables,
       and conditional logic like {{#if version}}...{{/if}}
   experimental:
     required: false
@@ -116,7 +138,7 @@ inputs:
   fetch_from_github:
     required: false
     default: "true"
-    description: If true (default), fetch the mise binary from GitHub. If false and using the latest version, fetch from mise.jdx.dev instead.
+    description: If true (default), fetch the mise binary from GitHub, falling back to mise.jdx.dev when the latest version is requested and the GitHub download fails. If false and using the latest version, fetch from mise.jdx.dev first and fall back to GitHub. A pinned version is only ever fetched from GitHub. Downloads are verified against the signed checksums either way.
   env:
     description: Automatically load mise environment variables for subsequent steps.
     required: false

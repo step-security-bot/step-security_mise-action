@@ -10,43 +10,36 @@ import * as path from 'path'
 import * as Handlebars from 'handlebars'
 import { validateSubscription } from './subscription-check.js'
 import { cacheKeyToSave } from './cache-save.js'
+import { cachePeriod } from './cache-period.js'
+import { configFileGlobs, templateUsesFileHash } from './config-hash.js'
+import { parseDuration, withThrottleRetry } from './cache-retry.js'
+import {
+  CURL_WRITE_OUT,
+  downloadError,
+  failedStatus,
+  hostOf,
+  parseCurlTrailer,
+  redirectedHost,
+  retryDownload
+} from './download-retry.js'
+import {
+  readCachedShasums,
+  shasumsPaths,
+  writeCachedShasums
+} from './shasums-cache.js'
 import { setupGitHubToken } from './github-token.js'
+import * as packslip from 'packslip'
+import { verifyAgainstPackslip } from './packslip.js'
+import { moveFile, tempRoot } from './file-move.js'
 import { parsePlugins } from './plugins.js'
 import { selectMiseRelease } from './release-index.js'
 import { toolVersionOutputs } from './tool-versions.js'
-
-// Configuration file patterns for cache key generation
-const MISE_CONFIG_FILE_PATTERNS = [
-  `**/.config/mise/config.toml`,
-  `**/.config/mise/config.lock`,
-  `**/.config/mise/config.*.toml`,
-  `**/.config/mise/config.*.lock`,
-  `**/.config/mise.toml`,
-  `**/.config/mise.lock`,
-  `**/.config/mise.*.toml`,
-  `**/.config/mise.*.lock`,
-  `**/.mise/config.toml`,
-  `**/.mise/config.lock`,
-  `**/.mise/config.*.toml`,
-  `**/.mise/config.*.lock`,
-  `**/mise/config.toml`,
-  `**/mise/config.lock`,
-  `**/mise/config.*.toml`,
-  `**/mise/config.*.lock`,
-  `**/.mise.toml`,
-  `**/.mise.lock`,
-  `**/.mise.*.toml`,
-  `**/.mise.*.lock`,
-  `**/mise.toml`,
-  `**/mise.lock`,
-  `**/mise.*.toml`,
-  `**/mise.*.lock`,
-  `**/.tool-versions`
-]
+import { buildInstallCommand } from './install-args.js'
+import { parseManagedPaths, selectPathAdditions } from './managed-paths.js'
 
 // Default cache key template
 const DEFAULT_CACHE_KEY_TEMPLATE =
-  '{{cache_key_prefix}}-{{platform}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}{{#if bootstrap_hash}}-{{bootstrap_hash}}{{/if}}{{#if plugins_hash}}-{{plugins_hash}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}'
+  '{{cache_key_prefix}}-{{platform}}{{#if version}}-{{version}}{{/if}}{{#if mise_env}}-{{mise_env}}{{/if}}{{#if install_args_hash}}-{{install_args_hash}}{{/if}}{{#if bootstrap_hash}}-{{bootstrap_hash}}{{/if}}{{#if plugins_hash}}-{{plugins_hash}}{{/if}}{{#if cache_period}}-p{{cache_period}}{{/if}}-{{#if file_hash}}{{file_hash}}{{else}}no-config{{/if}}'
 
 const ROOT_MISE_LOCK_FILE_PATTERNS = [/^\.?mise(?:\.[^.]+)?\.lock$/]
 const CONFIG_DIR_MISE_LOCK_FILE_PATTERNS = [/^mise(?:\.[^.]+)?\.lock$/]
@@ -59,15 +52,15 @@ const verifiedShasums = new Map<string, string>()
 
 type DownloadTool = 'curl' | 'wget'
 let cachedDownloadTool: DownloadTool | undefined
-const DOWNLOAD_RETRIES = 5
-const DOWNLOAD_RETRY_DELAY_MS = 2000
-
-class NonRetryableError extends Error {}
 class MiseIntegrityMismatchError extends Error {}
 
 async function run(): Promise<void> {
   await validateSubscription()
   try {
+    // Fail on a bad budget before any cache call, not partway through the run.
+    cacheRetryBudgetMs('restore')
+    cacheRetryBudgetMs('save')
+    setMiseEnv()
     await setToolVersions()
     await setMiseToml()
 
@@ -208,6 +201,7 @@ async function exportMiseEnv(): Promise<void> {
         cwd
       })
       const actualVars = JSON.parse(actualOutput.stdout)
+      const managedPaths = await getMiseManagedPaths(cwd)
 
       // Export environment variables and add only mise's PATH changes through
       // GITHUB_PATH. Exporting the complete computed PATH through GITHUB_ENV
@@ -216,7 +210,7 @@ async function exportMiseEnv(): Promise<void> {
         if (typeof value !== 'string') continue
 
         if (key.toUpperCase() === 'PATH') {
-          exportMisePath(value)
+          exportMisePath(value, managedPaths)
         } else {
           core.exportVariable(key, value)
         }
@@ -286,11 +280,29 @@ function getMisePathAdditions(computedPath: string): string[] {
   )
 }
 
-function exportMisePath(computedPath: string): void {
+/**
+ * The PATH entries mise manages, as `mise env --paths` reports them. Older
+ * mise versions reject the flag, so this returns undefined for them and the
+ * caller derives the entries from the computed PATH instead.
+ */
+async function getMiseManagedPaths(cwd: string): Promise<string[] | undefined> {
+  if (!core.getBooleanInput('export_path')) return undefined
+
+  const output = await exec.getExecOutput('mise', ['env', '--paths'], {
+    cwd,
+    silent: true,
+    ignoreReturnCode: true
+  })
+  return parseManagedPaths(output.exitCode, output.stdout)
+}
+
+function exportMisePath(computedPath: string, managedPaths?: string[]): void {
   if (!core.getBooleanInput('export_path')) return
 
-  const additions = getMisePathAdditions(computedPath)
-  for (const entry of additions.reverse()) {
+  const additions = selectPathAdditions(managedPaths, () =>
+    getMisePathAdditions(computedPath)
+  )
+  for (const entry of additions.slice().reverse()) {
     core.info(`Adding ${entry} to PATH`)
     core.addPath(entry)
   }
@@ -309,7 +321,9 @@ async function exportMisePathFromJson(cwd: string): Promise<void> {
       ([key, value]) =>
         key.toUpperCase() === 'PATH' && typeof value === 'string'
     )
-    if (pathEntry) exportMisePath(pathEntry[1] as string)
+    if (pathEntry) {
+      exportMisePath(pathEntry[1] as string, await getMiseManagedPaths(cwd))
+    }
   } catch {
     core.warning('Unable to export mise PATH entries from JSON output')
   }
@@ -348,6 +362,19 @@ function checkMiseSupportsRedacted(): boolean {
   }
 
   return false
+}
+
+/**
+ * Export the `mise_env` input as MISE_ENV. This runs before the cache key is
+ * computed, so the key, the install, and later steps all use the same
+ * environment. The input wins over an existing MISE_ENV, like `mise_dir` does
+ * over MISE_DATA_DIR.
+ */
+function setMiseEnv(): void {
+  const miseEnv = core.getInput('mise_env')
+  if (!miseEnv) return
+  core.info(`Setting MISE_ENV=${miseEnv}`)
+  core.exportVariable('MISE_ENV', miseEnv)
 }
 
 /** Set mise defaults, action authentication, and the optional shims path. */
@@ -392,6 +419,25 @@ async function setEnvVars(): Promise<void> {
   }
 }
 
+/** Run a cache call, retrying while GitHub throttles it (see cache-retry.ts). */
+function cacheRetryBudgetMs(kind: 'restore' | 'save'): number {
+  const input = `cache_${kind}_retry_budget`
+  return parseDuration(core.getInput(input), input)
+}
+
+function retryCache<T>(
+  kind: 'restore' | 'save',
+  op: () => Promise<T>
+): Promise<T> {
+  return withThrottleRetry(op, {
+    budgetMs: cacheRetryBudgetMs(kind),
+    onRetry: (delayMs, remainingMs) =>
+      core.info(
+        `GitHub throttled the cache ${kind}; retrying in ${(delayMs / 1000).toFixed(1)}s (${(remainingMs / 1000).toFixed(1)}s of retry budget left)`
+      )
+  })
+}
+
 async function restoreMiseCache(): Promise<string | undefined> {
   core.startGroup('Restoring mise cache')
   const cachePath = miseDir()
@@ -404,7 +450,9 @@ async function restoreMiseCache(): Promise<string | undefined> {
   core.saveState('PRIMARY_KEY', primaryKey)
   core.saveState('MISE_DIR', cachePath)
 
-  const cacheKey = await cache.restoreCache([cachePath], primaryKey)
+  const cacheKey = await retryCache('restore', () =>
+    cache.restoreCache([cachePath], primaryKey)
+  )
   core.setOutput('cache-hit', Boolean(cacheKey))
 
   if (!cacheKey) {
@@ -456,10 +504,13 @@ async function setupMise(
     versionFile
   ]
   let binCacheKey: string | undefined
+  let binCacheFiles = binCachePaths
   const useBinCache = async (v: string): Promise<void> => {
     if (!core.getBooleanInput('cache')) return
     binCacheKey = `mise-bin-v1-${target}-${getRunnerImageId()}-${v}`
-    await restoreMiseBinCache(binCacheKey, binCachePaths)
+    // The signed checksums go with the binary they verify.
+    binCacheFiles = [...binCachePaths, ...shasumsPaths(miseBinDir, v)]
+    await restoreMiseBinCache(binCacheKey, binCacheFiles)
   }
   if (!resolvedVersion && autoUpdate) {
     resolvedVersion = cleanVersion(
@@ -585,7 +636,7 @@ async function setupMise(
         checksumAssetName,
         async (downloadPath, tempDir) => {
           if (!extractArchive) {
-            await io.mv(downloadPath, miseBinPath)
+            await moveIntoPlace(downloadPath, miseBinPath)
             await exec.exec('chmod', ['+x', miseBinPath])
             return
           }
@@ -600,7 +651,7 @@ async function setupMise(
                     'mise',
                     'bin'
                   )
-                  await io.mv(
+                  await moveIntoPlace(
                     path.join(extractedMiseBinDir, 'mise.exe'),
                     miseBinPath
                   )
@@ -628,13 +679,18 @@ async function setupMise(
               )
               break
             default:
-              await io.mv(downloadPath, miseBinPath)
+              await moveIntoPlace(downloadPath, miseBinPath)
               await exec.exec('chmod', ['+x', miseBinPath])
               break
           }
         }
       )
     }
+    // The CDN only serves the newest binary, so it is a fallback only when
+    // that is what was asked for. It is verified against the signed checksums
+    // for `resolvedVersion` either way, so a newer CDN build fails the check
+    // rather than being trusted.
+    const cdnEligible = !version && !useMinimumReleaseAge
     try {
       if (fetchFromCdn) {
         await installFromUrl(cdnUrl, rawAssetName, rawAssetName, false)
@@ -642,18 +698,41 @@ async function setupMise(
         await installFromUrl(githubUrl, assetName, assetName, true)
       }
     } catch (err) {
-      if (!fetchFromCdn) {
+      if (fetchFromCdn) {
+        core.warning(
+          `Could not verify mise from the CDN: ${errorMessage(err)}. Falling back to the verified GitHub release asset.`
+        )
+        await installFromUrl(githubUrl, assetName, assetName, true)
+      } else if (cdnEligible) {
+        core.warning(
+          `Could not install mise from GitHub: ${errorMessage(err)}. Falling back to the verified CDN binary.`
+        )
+        await installFromUrl(cdnUrl, rawAssetName, rawAssetName, false)
+      } else {
         throw err
       }
-      core.warning(
-        `Could not verify mise from the CDN: ${errorMessage(err)}. Falling back to the verified GitHub release asset.`
-      )
-      await installFromUrl(githubUrl, assetName, assetName, true)
     }
   }
   await ensureWindowsMiseShim(miseBinPath, miseShimPath, installedVersion)
   if (needsInstall) {
     await fs.promises.writeFile(versionFile, installedVersion)
+    // Releases checked against a packslip never fetch the signed checksums, so
+    // save them now: the cache saved after this run is what later runs verify
+    // the binary from.
+    // A configured `sha256` is verified instead, so the checksums are never
+    // fetched and there is nothing to save.
+    if (
+      !core.getInput('sha256') &&
+      !miseReleasePredatesMinisign(installedVersion)
+    ) {
+      try {
+        await verifiedMiseShasums(installedVersion)
+      } catch (err) {
+        core.info(
+          `Could not save signed checksums for mise@${installedVersion}: ${errorMessage(err)}`
+        )
+      }
+    }
   }
   // compare with provided hash
   const want = core.getInput('sha256')
@@ -669,7 +748,7 @@ async function setupMise(
   }
 
   if (needsInstall && binCacheKey && core.getBooleanInput('cache_save')) {
-    await saveMiseBinCache(binCacheKey, binCachePaths)
+    await saveMiseBinCache(binCacheKey, binCacheFiles)
   }
 
   core.addPath(miseBinDir)
@@ -697,7 +776,7 @@ async function restoreMiseBinCache(
   paths: string[]
 ): Promise<void> {
   try {
-    if (await cache.restoreCache(paths, key)) {
+    if (await retryCache('restore', () => cache.restoreCache(paths, key))) {
       core.info(`mise binary restored from key: ${key}`)
     }
   } catch (err) {
@@ -707,7 +786,7 @@ async function restoreMiseBinCache(
 
 async function saveMiseBinCache(key: string, paths: string[]): Promise<void> {
   try {
-    await cache.saveCache(paths, key)
+    await retryCache('save', () => cache.saveCache(paths, key))
     core.info(`mise binary cached with key: ${key}`)
   } catch (err) {
     core.warning(`Failed to save mise binary cache: ${errorMessage(err)}`)
@@ -758,7 +837,7 @@ async function installWindowsMiseShim(
     return
   }
 
-  await io.mv(extractedMiseShimPath, miseShimPath)
+  await moveIntoPlace(extractedMiseShimPath, miseShimPath)
 }
 
 async function ensureWindowsMiseShim(
@@ -813,30 +892,123 @@ async function getDownloadTool(): Promise<DownloadTool> {
   return cachedDownloadTool
 }
 
-async function retryDownload<T>(fn: () => Promise<T>): Promise<T> {
-  for (let retry = 0; ; retry++) {
+interface DownloadResponse {
+  exitCode: number
+  /** Final HTTP status after redirects; absent when none could be read. */
+  status?: number
+  /** Host that sent the final response (differs from the request after a redirect). */
+  host?: string
+  body: string
+  tool: 'curl' | 'wget'
+  /** The tool could not write the file (disk full, bad path): retrying won't help. */
+  localError: boolean
+}
+
+/**
+ * One attempt with curl or wget. curl reports the final status through
+ * `--write-out`; wget through `--server-response`, which prints each
+ * response's status line to stderr. wget gets one try because the retry loop
+ * owns the policy. With `filePath` the body goes to that file (replacing any
+ * partial one), otherwise it is returned.
+ */
+async function requestOnce(
+  url: string,
+  filePath?: string
+): Promise<DownloadResponse> {
+  const tool = await getDownloadTool()
+  const opts = { silent: true, ignoreReturnCode: true }
+  if (tool === 'curl') {
+    // The body always goes to a file and `--write-out` carries no newline:
+    // MSYS curl.exe (Rtools, Git for Windows) splits a literal newline in the
+    // argument, which broke reading the status from a stdout that also held
+    // the body.
+    const tempDir = filePath
+      ? undefined
+      : await fs.promises.mkdtemp(
+          path.join(tempRoot(process.env, os.tmpdir()), 'mise-action-')
+        )
+    const outPath = filePath ?? path.join(tempDir as string, 'body')
     try {
-      return await fn()
-    } catch (err) {
-      if (err instanceof NonRetryableError || retry === DOWNLOAD_RETRIES)
-        throw err
-      core.warning(
-        `Download failed: ${errorMessage(err)}. Retrying in ${DOWNLOAD_RETRY_DELAY_MS / 1000} seconds (${retry + 1}/${DOWNLOAD_RETRIES}).`
+      const rsp = await exec.getExecOutput(
+        'curl',
+        ['-sSL', '-w', CURL_WRITE_OUT, '--output', outPath, url],
+        opts
       )
-      await new Promise(resolve => setTimeout(resolve, DOWNLOAD_RETRY_DELAY_MS))
+      const { status, effectiveUrl } = parseCurlTrailer(rsp.stdout)
+      return {
+        exitCode: rsp.exitCode,
+        status,
+        host: hostOf(effectiveUrl),
+        // A failed transfer may leave no file; after a successful one a read
+        // error is real and must surface rather than look like an empty body.
+        body:
+          tempDir && rsp.exitCode === 0
+            ? await fs.promises.readFile(outPath, 'utf8')
+            : '',
+        tool,
+        // curl exit 23: write error
+        localError: rsp.exitCode === 23
+      }
+    } finally {
+      if (tempDir) await io.rmRF(tempDir)
     }
+  }
+  const rsp = await exec.getExecOutput(
+    'wget',
+    ['-q', '--tries=1', '--server-response', '-O', filePath ?? '-', url],
+    opts
+  )
+  const statuses = [...rsp.stderr.matchAll(/HTTP\/\S+\s+(\d{3})/g)]
+  const last = statuses[statuses.length - 1]
+  // Each redirect prints a `Location:` header, possibly relative to the
+  // previous hop; following them all gives the host that answered last.
+  const locations = [...rsp.stderr.matchAll(/^\s*Location:\s*(\S+)/gim)].map(
+    m => m[1]
+  )
+  return {
+    exitCode: rsp.exitCode,
+    status: last ? Number(last[1]) : undefined,
+    host: redirectedHost(url, locations),
+    body: rsp.stdout,
+    tool,
+    // wget exit 3: file I/O error
+    localError: rsp.exitCode === 3
   }
 }
 
+/**
+ * Download `url` with retries (see download-retry.ts) and return the body, or
+ * write it to `filePath` and return an empty string. With `notFoundOk`, an
+ * HTTP 404 returns undefined instead of failing.
+ */
+async function download(
+  url: string,
+  opts: { filePath?: string; notFoundOk?: boolean } = {}
+): Promise<string | undefined> {
+  return retryDownload(
+    async () => {
+      const rsp = await requestOnce(url, opts.filePath)
+      if (opts.notFoundOk && rsp.status === 404) return undefined
+      const ok =
+        rsp.exitCode === 0 &&
+        (rsp.status === undefined || (rsp.status >= 200 && rsp.status < 300))
+      if (ok) return rsp.body
+      if (opts.filePath) await io.rmRF(opts.filePath)
+      throw downloadError({
+        url,
+        status: failedStatus(rsp.status, rsp.exitCode),
+        host: rsp.host,
+        tool: rsp.tool,
+        exitCode: rsp.exitCode,
+        localError: rsp.localError
+      })
+    },
+    { onRetry: core.warning }
+  )
+}
+
 async function downloadToFile(url: string, filePath: string): Promise<void> {
-  const tool = await getDownloadTool()
-  await retryDownload(async () => {
-    if (tool === 'curl') {
-      await exec.exec('curl', ['-fsSL', url, '--output', filePath])
-    } else {
-      await exec.exec('wget', ['-qO', filePath, url])
-    }
-  })
+  await download(url, { filePath })
 }
 
 async function downloadText(url: string): Promise<string> {
@@ -844,18 +1016,14 @@ async function downloadText(url: string): Promise<string> {
 }
 
 async function downloadRawText(url: string): Promise<string> {
-  const tool = await getDownloadTool()
-  return retryDownload(async () => {
-    if (tool === 'curl') {
-      const rsp = await exec.getExecOutput('curl', ['-fsSL', url], {
-        silent: true
-      })
-      return rsp.stdout
-    }
-    const rsp = await exec.getExecOutput('wget', ['-qO-', url], {
-      silent: true
-    })
-    return rsp.stdout
+  return (await download(url)) as string
+}
+
+function moveIntoPlace(src: string, dest: string): Promise<void> {
+  return moveFile(src, dest, {
+    mv: (s, d) => io.mv(s, d),
+    copyFile: (s, d) => fs.promises.copyFile(s, d),
+    unlink: p => fs.promises.unlink(p)
   })
 }
 
@@ -867,7 +1035,7 @@ async function withDownloadedMiseAsset(
   fn: (downloadPath: string, tempDir: string) => Promise<void>
 ): Promise<void> {
   const tempDir = await fs.promises.mkdtemp(
-    path.join(os.tmpdir(), 'mise-action-')
+    path.join(tempRoot(process.env, os.tmpdir()), 'mise-action-')
   )
   try {
     const downloadPath = path.join(tempDir, assetName)
@@ -881,12 +1049,37 @@ async function withDownloadedMiseAsset(
   }
 }
 
+/**
+ * Downloads the packslip bundle with the same proxy-aware curl/wget as every
+ * other download; undefined when the release has none (HTTP 404). Any other
+ * failure throws, so a missing packslip is the only thing that falls back.
+ */
+async function fetchPackslipBundle(url: string): Promise<string | undefined> {
+  return download(url, { notFoundOk: true })
+}
+
 async function verifyDownloadedMiseAsset(
   filePath: string,
   version: string,
   assetName: string
 ): Promise<void> {
   if (core.getInput('sha256')) {
+    return
+  }
+
+  // The signed packslip is the primary assertion. Releases before 2026.9.3 fall
+  // through to the minisign checksums; a packslip that fails verification
+  // throws and never falls back to the weaker check.
+  if (
+    await verifyAgainstPackslip(
+      filePath,
+      version,
+      assetName,
+      fetchPackslipBundle,
+      packslip
+    )
+  ) {
+    core.info(`Verified ${assetName} against the signed packslip`)
     return
   }
 
@@ -971,12 +1164,20 @@ async function verifiedMiseShasums(
     return cached
   }
 
+  const binDir = path.join(miseDir(), 'bin')
+  const saved = readCachedShasums(binDir, version, verifyMinisign)
+  if (saved) {
+    verifiedShasums.set(version, saved)
+    return saved
+  }
+
   try {
     const shasumsUrl = `https://github.com/jdx/mise/releases/download/v${version}/SHASUMS256.txt`
     const minisigUrl = `${shasumsUrl}.minisig`
     const shasums = await downloadRawText(shasumsUrl)
     const minisig = await downloadRawText(minisigUrl)
     verifyMinisign(shasums, minisig)
+    writeCachedShasums(binDir, version, shasums, minisig)
     verifiedShasums.set(version, shasums)
     return shasums
   } catch (err) {
@@ -1245,20 +1446,36 @@ let supportsLockedInstall: boolean | undefined
 
 const miseInstall = async (): Promise<number> => {
   const installArgs = core.getInput('install_args').trim()
-  const useLocked =
-    (await shouldUseLockedInstall()) &&
-    !/(^|\s)--locked(?:\s|$)/.test(installArgs)
-  const command = [
-    'install',
-    ...(useLocked ? ['--locked'] : []),
-    ...(installArgs ? [installArgs] : [])
-  ].join(' ')
+  const useLocked = await shouldUseLockedInstall()
+  const useMonorepo =
+    core.getBooleanInput('monorepo') &&
+    (/(^|\s)--monorepo(?:\s|$)/.test(installArgs) ||
+      (await hasMonorepoConfigRoots()))
+  const command = buildInstallCommand(installArgs, useLocked, useMonorepo)
 
   if (useLocked) {
     core.info('Detected a mise lock file, running `mise install --locked`')
   }
 
   return mise([command])
+}
+
+/**
+ * Ask mise itself to read the effective TOML config rather than trying to
+ * parse TOML (including its supported config locations and syntax) here.
+ */
+async function hasMonorepoConfigRoots(): Promise<boolean> {
+  const { stdout, exitCode } = await exec.getExecOutput(
+    'mise',
+    ['config', 'get', 'monorepo.config_roots'],
+    {
+      cwd: getCwd(),
+      env: { ...process.env, NO_COLOR: '1' },
+      ignoreReturnCode: true,
+      silent: true
+    }
+  )
+  return exitCode === 0 && stdout.trim().length > 0
 }
 const miseBootstrap = async (): Promise<number> => {
   const installArgs = core.getInput('install_args').trim()
@@ -1360,11 +1577,34 @@ async function post(): Promise<void> {
   }
 }
 
+/**
+ * End the process once `work` settles instead of waiting for the event loop to
+ * drain. `@actions/cache` leaves a segment timer armed after a failed download
+ * (actions/toolkit#2470), which would keep the step open for ten minutes.
+ * `process.exit()` keeps the exit code `core.setFailed` set. Queued output is
+ * flushed first, but only for a bounded time, so the leaked timer can't hold
+ * the step open through a stream that never drains.
+ */
+async function exitWhenDone(work: Promise<void>): Promise<void> {
+  try {
+    await work
+  } catch (err) {
+    core.setFailed(errorMessage(err))
+  }
+  const flush = (stream: NodeJS.WriteStream): Promise<void> =>
+    new Promise(resolve => stream.write('', () => resolve()))
+  await Promise.race([
+    Promise.all([flush(process.stdout), flush(process.stderr)]),
+    new Promise(resolve => setTimeout(resolve, 5000))
+  ])
+  process.exit()
+}
+
 if (core.getState('IS_POST')) {
-  void post()
+  void exitWhenDone(post())
 } else {
   core.saveState('IS_POST', 'true')
-  void run()
+  void exitWhenDone(run())
 }
 
 function getCwd(): string {
@@ -1475,7 +1715,9 @@ async function saveCache(cacheKey: string): Promise<void> {
       throw new Error(`Cache folder path does not exist on disk: ${cachePath}`)
     }
 
-    const cacheId = await cache.saveCache([cachePath], cacheKey)
+    const cacheId = await retryCache('save', () =>
+      cache.saveCache([cachePath], cacheKey)
+    )
     if (cacheId === -1) return
 
     core.info(`Cache saved from ${cachePath} with key: ${cacheKey}`)
@@ -1519,8 +1761,15 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
   const miseEnv = process.env.MISE_ENV?.replace(/,/g, '-')
   const platform = `${await getTarget()}-${getRunnerImageId()}`
 
-  // Calculate file hash
-  const fileHash = await glob.hashFiles(MISE_CONFIG_FILE_PATTERNS.join('\n'))
+  // Calculate file hash, unless the template can't reach it
+  let fileHash = ''
+  if (templateUsesFileHash(template)) {
+    const start = Date.now()
+    fileHash = await glob.hashFiles(configFileGlobs(getCwd()).join('\n'))
+    core.info(
+      `Hashed mise config files in ${((Date.now() - start) / 1000).toFixed(1)}s`
+    )
+  }
 
   // Calculate install args hash
   let installArgsHash = ''
@@ -1564,7 +1813,10 @@ async function processCacheKeyTemplate(template: string): Promise<string> {
     mise_env: miseEnv,
     install_args_hash: installArgsHash,
     bootstrap_hash: bootstrapHash,
-    plugins_hash: pluginsHash
+    plugins_hash: pluginsHash,
+    cache_period: cachePeriod(
+      Number(core.getInput('cache_max_age_days').trim() || '30')
+    )
   }
 
   // Calculate the default cache key by processing the default template
