@@ -21,13 +21,17 @@ jobs:
           # minimum_release_age: 7d # default: 24h; use 0s to disable the delay
           install: true # [default: true] run `mise install`
           install_args: "bun" # [default: ""] additional arguments to `mise install`
+          monorepo: true # [default: true] add `--monorepo` when monorepo.config_roots is configured
           bootstrap: false # [default: false] run `mise bootstrap` instead of `mise install`
           bootstrap_skip: "tools,task" # [default: ""] comma-separated parts to skip when bootstrapping
           bootstrap_args: "--yes" # [default: ""] additional arguments to `mise bootstrap`
           cache: true # [default: true] cache mise using GitHub's cache
+          cache_restore_retry_budget: 60s # [default: 0s] keep retrying a cache restore throttled with HTTP 429 for up to this long
+          cache_save_retry_budget: 60s # [default: 0s] same, for cache saves
           cache_save_post: false # [default: false] save the cache in the post step, after later steps install more tools
           experimental: true # [default: false] enable experimental features
           log_level: debug # [default: info] log level
+          mise_env: ci # [default: ""] export MISE_ENV for the action and later steps
           # automatically write this .tool-versions file
           tool_versions: |
             shellcheck 0.11.0
@@ -80,6 +84,41 @@ API quota. If the index is unavailable
 or invalid, the action fails rather than bypassing the age policy.
 This input controls the mise binary; it does not set the release-age policy for
 tools installed by mise.
+
+## mise Environments (`MISE_ENV`)
+
+Set `mise_env` to pick the [mise environment](https://mise.jdx.dev/configuration/environments.html)
+the job uses:
+
+```yaml
+- uses: step-security/mise-action@v5
+  with:
+    mise_env: ci # loads mise.ci.toml on top of mise.toml
+- run: mise run test # also runs with MISE_ENV=ci
+```
+
+The action exports the value as `MISE_ENV`, so the cache key, `mise install`,
+and every later step in the job use the same configs. The input wins over a
+`MISE_ENV` that is already set.
+
+Setting `MISE_ENV` in `env:` on the action's step alone is not enough: the
+action installs and caches tools for that environment, but later steps do not
+see the variable and fall back to the base config. Job-level or workflow-level
+`env:` works too; the input is for when that is not available, such as a
+composite action that picks the environment from its own inputs:
+
+```yaml
+# .github/actions/setup/action.yml
+inputs:
+  haskell:
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - uses: step-security/mise-action@v5
+      with:
+        mise_env: ${{ inputs.haskell == 'true' && 'ci' || 'ci-no-haskell' }}
+```
 
 ## Environment and PATH Export
 
@@ -136,6 +175,30 @@ You can customize the cache key used by the action:
     cache_key_prefix: "mise-cache-v1"       # Or just change the prefix (default: "mise-v1")
 ```
 
+### Retrying throttled cache requests
+
+When GitHub's cache service answers HTTP 429 (too many requests), the restore is treated as a cache miss and the save is skipped. To wait it out instead, give each a retry budget:
+
+```yaml
+- uses: step-security/mise-action@v5
+  with:
+    cache_restore_retry_budget: 60s
+    cache_save_retry_budget: 120s
+```
+
+Each wait is at least the `Retry-After` GitHub advertises (1s if absent) plus random jitter of up to 2s, and the whole wait counts against the budget. When the next wait would exceed what is left, the action gives up and falls back as before: a restore miss installs the tools, a save is skipped. Both default to `0s` (no retries). Genuine cache misses and reservation conflicts (another job is saving the same key) are not throttling and are never retried. The budgets also apply to the mise binary cache.
+
+`@actions/cache` hides the 429 from callers and only logs it, so the action detects throttling from the warnings and debug lines it writes. If a future `@actions/cache` changes their wording, throttling goes undetected and nothing is retried.
+
+The default key also expires: it includes a period number, so the cache is rebuilt from scratch at least every `cache_max_age_days` days (default `30`, `0` disables) and picks up the latest mise. This only helps runners that start clean: a self-hosted runner that keeps the mise data directory between jobs keeps its installed mise across a rollover, so set `auto_update: true` there. A custom `cache_key` replaces the default key and doesn't expire unless it includes `{{cache_period}}`:
+
+```yaml
+- uses: step-security/mise-action@v5
+  with:
+    cache_max_age_days: 14
+    cache_key: "my-key-{{cache_period}}-{{file_hash}}"
+```
+
 ### Using Another Cache Action
 
 The built-in cache uses GitHub's cache. To store the cache elsewhere (for example with [step-security/runs-on-cache](https://github.com/step-security/runs-on-cache) and S3), turn the built-in cache off and cache the mise data directory yourself with any action that has the `actions/cache` interface:
@@ -151,6 +214,48 @@ The built-in cache uses GitHub's cache. To store the cache elsewhere (for exampl
 ```
 
 The path to cache is mise's data directory, `~/.local/share/mise` by default (`%LOCALAPPDATA%\mise` on Windows). The action uses the first of these that is set: its `mise_dir` input, then `MISE_DATA_DIR`, then `$XDG_DATA_HOME/mise`, then the default above. When `mise_dir` is set, the action also exports it as `MISE_DATA_DIR` so mise installs tools into the cached directory; mise's state directory is unaffected (set `MISE_STATE_DIR` to move it). If several are set, `path` must be the directory that wins in that order. Build the key from your config files as above (list every config name your repo uses, including environment-specific `mise.<env>.toml` files, since the key must change whenever the tools do), and add anything else that should invalidate it (`install_args`, `MISE_ENV`, the runner image).
+
+### Cache Validated Downloads
+
+With a committed `mise.lock`, mise verifies cached downloads against lockfile checksums before use, so a poisoned or stale cache cannot change what gets installed. Only downloads with checksums are reused. Tools are unpacked and installed each run; source-built tools compile each time. See mise's [CI guidance](https://mise.jdx.dev/continuous-integration.html#cache-downloads-not-installs) for details.
+
+```yaml
+- uses: actions/cache@v6
+  with:
+    path: ~/.cache/mise/downloads-cas
+    key: mise-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.lock') }}
+- uses: step-security/mise-action@v5
+  with:
+    cache: false
+```
+
+The path is mise's default cache directory on Linux. On macOS, cache `~/Library/Caches/mise/downloads-cas`; on Windows, mise uses `%TEMP%\mise\downloads-cas` by default. `actions/cache` does not expand `%TEMP%`, so on Windows set `MISE_CACHE_DIR` and use the matching resolved path:
+
+```yaml
+env:
+  MISE_CACHE_DIR: ${{ runner.temp }}\mise
+steps:
+  - uses: actions/cache@v6
+    with:
+      path: ${{ runner.temp }}\mise\downloads-cas
+      key: mise-downloads-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('mise.lock') }}
+```
+
+If you set `MISE_CACHE_DIR` to a different location, cache `downloads-cas` under it. See mise's [directories](https://mise.jdx.dev/directories.html).
+
+This is a separate cache from the action's built-in installed-tools cache. The action's `cache-hit` output describes only its built-in cache and does not report hits from this external downloads cache.
+
+### Release workflows
+
+Don't restore a cache in a workflow that publishes artifacts. A release job can restore caches written on the default branch, so a lower-trust workflow that can write there, such as one triggered by `pull_request_target`, `workflow_run` or `issue_comment` that runs untrusted code, can put files of an attacker's choosing into the release. An ordinary `pull_request` build only writes to its own merge-ref scope, which a release job doesn't restore. This action's cache holds installed tools. Turn it off in release jobs:
+
+```yaml
+- uses: step-security/mise-action@v5
+  with:
+    cache: false
+```
+
+Setting GitHub's `cache-mode: none` on the workflow or job also works. The action honors it, so it skips both restore and save, as do other steps that use the cache.
 
 ### Template Variables in Cache Keys
 
@@ -169,10 +274,11 @@ Available template variables:
 - `{{cache_key_prefix}}` - The cache key prefix (from `cache_key_prefix` input or default)
 - `{{platform}}` - The target platform, including the runner image (e.g., "linux-x64-ubuntu24", "macos-arm64-macos15", "linux-x64-self-hosted"). The trailing segment is `process.env.ImageOS` on github-hosted runners and falls back to `"self-hosted"` elsewhere — preventing cache collisions when the same repo runs on different runner providers (github-hosted, namespace.so, self-hosted).
 - `{{file_hash}}` - Hash of all mise configuration files
-- `{{mise_env}}` - The MISE_ENV environment variable value
+- `{{mise_env}}` - The `MISE_ENV` value (from the `mise_env` input or the environment)
 - `{{install_args_hash}}` - SHA256 hash of the sorted tools from install args
 - `{{bootstrap_hash}}` - SHA256 hash of bootstrap mode, skip list, and args
 - `{{plugins_hash}}` - SHA256 hash of the `plugins` input (empty when unset)
+- `{{cache_period}}` - The current `cache_max_age_days` period number (empty when that is `0`)
 - `{{default}}` - The processed default cache key (useful for extending)
 
 Conditional logic is also supported using Handlebars syntax like `{{#if version}}...{{/if}}`.
@@ -298,6 +404,14 @@ will be added automatically unless you already included it yourself.
 This auto-detection is intended for repo-managed config files. If you provide
 `mise_toml` or `tool_versions` inputs, the action does not automatically force
 locked mode.
+
+## Monorepo installs
+
+When the mise configuration defines `[monorepo].config_roots`, the action
+automatically adds `--monorepo` to `mise install` so tools configured across
+the monorepo are installed. This is enabled by default and does nothing for
+repositories without that setting. Set `monorepo: false` to opt out. You can
+also pass `--monorepo` explicitly through `install_args`.
 
 ## Bootstrap
 
