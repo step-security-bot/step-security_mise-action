@@ -8,11 +8,4 @@ node = '24'
 git-cliff = 'latest'
 gh = 'latest'
 communique = { version = 'latest', minimum_release_age = '0s' }
-<<<<<<< 373ca6b2b2746890c3d49ed12499949907a6d438
-=======
-# hk.pkl amends a pinned hk package; the tools themselves float and are resolved by mise.lock.
-hk = { version = 'latest', minimum_release_age = '0s' }
-pkl = 'latest'
-jactionlint = 'latest'
 oxfmt = 'latest'
->>>>>>> a9c93d96ff30df63a918e61d4b03124645d535ba

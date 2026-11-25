@@ -39,7 +39,7 @@ test('failure messages name the status and host, not the query', () => {
     'example.com/…/b.tar.zst'
   )
   const err = downloadError({
-    url: 'https://github.com/jdx/mise/releases/download/v1/x.tar.zst',
+    url: 'https://github.com/step-security/mise/releases/download/v1/x.tar.zst',
     status: 503,
   })
   assert.match(err.message, /HTTP 503 from github\.com/)
@@ -118,7 +118,7 @@ test('diagnostics name an allowlisted reason, never the tool output', () => {
   assert.equal(exitReason('wget', 4), 'wget exit 4 (network failure)')
   assert.equal(exitReason('curl', 99), 'curl exit 99')
   const err = downloadError({
-    url: 'https://github.com/jdx/mise/releases/download/v1/x.tar.zst?token=secret',
+    url: 'https://github.com/step-security/mise/releases/download/v1/x.tar.zst?token=secret',
     status: 503,
     tool: 'wget',
     exitCode: 8
@@ -148,7 +148,7 @@ test('hostOf never returns userinfo', () => {
 
 test('reports the host that sent the failing response after a redirect', () => {
   const err = downloadError({
-    url: 'https://github.com/jdx/mise/releases/download/v1/x.tar.zst',
+    url: 'https://github.com/step-security/mise/releases/download/v1/x.tar.zst',
     status: 503,
     host: 'objects.githubusercontent.com',
   })
